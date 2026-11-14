@@ -1,0 +1,19 @@
+# Loom (`loom-scrubber`) — LLM Context Specification
+
+> Bidirectional, format-preserving cryptographic PII, IP, and secret pseudonymizer written in 100% safe Rust (2024 Edition, `#![forbid(unsafe_code)]`).
+
+## Core Capabilities
+- `loom weave [-i <file>] [-o <file>] [--dir <repo>]`: Pseudonymizes IPv4 addresses, emails, API keys, JWTs, OS user paths, UUIDs, and custom dictionary terms into syntactically valid RFC 5737/2606 synthetic equivalents.
+- `loom unweave [-i <file>] [-o <file>]`: Restores synthetic tokens back to their exact original values using SIMD `Aho-Corasick` (`LeftmostLongest`) and 8-round `BLAKE3` Feistel FPE inversion.
+- `loom clip [--restore]`: Scrubs or restores the system clipboard in-place.
+- `loom audit [<dir>] [--json] [--fail-on-leak]`: Git-aware repository scanner that detects leaked PII, internal IPs, keys, user paths, and custom dictionary terms.
+- `loom dict add --term <real> [--alias <syn>]` / `loom dict list`: Manages custom terms in the `XChaCha20-Poly1305` encrypted SQLite WAL ledger.
+- `loom tui [--file <path>]`: Ratatui v0.30+ side-by-side Raw vs. Woven diff viewer and encrypted ledger inspector.
+
+## Source Map
+- `src/crypto/mod.rs`: `Argon2id` + `HKDF-SHA256` + `BLAKE3` MAC + `XChaCha20-Poly1305` AEAD.
+- `src/crypto/fpe.rs`: 8-round balanced Feistel Format-Preserving Encryption (`feistel16`, `feistel32`, `feistel64`, `fpe_encrypt_ipv4_192_168`, `fpe_encrypt_uuid`).
+- `src/store/mod.rs`: Blind-indexed SQLite WAL ledger (`rusqlite 0.42.0`) + `enforce_owner_only_acl`.
+- `src/detector/`: `Aho-Corasick` + `regex` DFA span detector (`DICT`, `KEY`, `JWT`, `MAIL`, `PATH`, `UUID`, `IPV4`).
+- `src/engine/`: Stream weave/unweave processor (`mod.rs`) and git-aware directory auditor (`repo.rs`).
+- `src/tui/`: Ratatui v0.30+ 3-pane viewer + `sanitize_terminal_str` (`CWE-150`).
