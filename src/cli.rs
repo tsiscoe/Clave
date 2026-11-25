@@ -15,9 +15,9 @@ pub struct Cli {
     #[arg(long, env = "CLAVE_DB_PATH", global = true)]
     pub db: Option<PathBuf>,
 
-    /// Passphrase used to derive the Argon2id + HKDF-SHA256 key hierarchy.
-    #[arg(long, env = "CLAVE_PASSPHRASE", global = true)]
-    pub passphrase: Option<String>,
+    /// Path to a restricted file containing the vault passphrase (or set CLAVE_PASSPHRASE env var).
+    #[arg(long, global = true)]
+    pub passphrase_file: Option<PathBuf>,
 
     /// Store or load the master passphrase from the OS native keyring (`windows-native`, `apple-native`, `linux-native`).
     #[arg(long, global = true, default_value_t = false)]
@@ -104,10 +104,14 @@ pub enum DictAction {
         alias: Option<String>,
     },
 
-    /// List all encrypted token mappings currently stored in the ledger.
+    /// List encrypted token mappings stored in the ledger (redacts real values unless --reveal is set).
     List {
         /// Emit mappings as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// Explicitly decrypt and display sensitive real values (`CLAVE-HORDE-05`).
+        #[arg(long, default_value_t = false)]
+        reveal: bool,
     },
 }

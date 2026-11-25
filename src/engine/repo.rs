@@ -90,16 +90,24 @@ pub fn audit_directory(root_dir: &Path, detector: &LoomDetector) -> Result<Audit
             .display()
             .to_string();
 
-        for (idx, line) in content.lines().enumerate() {
-            let spans = detector.detect_spans(line);
-            for span in spans {
-                findings.push(AuditFinding {
-                    file_path: rel_display.clone(),
-                    line_number: idx + 1,
-                    category: span.category.as_str().to_string(),
-                    snippet: span.matched_text,
-                });
-            }
+        let spans = detector.detect_spans(&content);
+        for span in spans {
+            let line_number = 1 + content[..span.start]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count();
+            let first_line = span.matched_text.lines().next().unwrap_or("");
+            let snippet = if span.matched_text.contains('\n') {
+                format!("{first_line} ... [multiline]")
+            } else {
+                first_line.to_string()
+            };
+            findings.push(AuditFinding {
+                file_path: rel_display.clone(),
+                line_number,
+                category: span.category.as_str().to_string(),
+                snippet,
+            });
         }
     }
 
@@ -147,10 +155,22 @@ pub fn weave_directory_in_place(
 
         let outcome = engine.weave_text(&content)?;
         if outcome.replacements_count > 0 {
-            // [SEC-03]: Atomic temp-file write + rename so interrupted operations never truncate source files
-            let tmp_path = canonical_file.with_extension("loom_atomic_tmp");
-            std::fs::write(&tmp_path, &outcome.woven_text)?;
-            std::fs::rename(&tmp_path, &canonical_file)?;
+            // [SEC-03 / CLAVE-HORDE-04]: Per-file CSPRNG NamedTempFile in parent directory prevents
+            // same-stem `.loom_atomic_tmp` collisions and cleans up automatically on interrupted writes.
+            let parent_dir = canonical_file.parent().unwrap_or(&canonical_root);
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".clave_atomic_")
+                .suffix(".loom_tmp")
+                .tempfile_in(parent_dir)
+                .with_context(|| {
+                    format!("failed to create atomic temp file in {}", parent_dir.display())
+                })?;
+            if let Ok(orig_meta) = std::fs::metadata(&canonical_file) {
+                let _ = tmp.as_file().set_permissions(orig_meta.permissions());
+            }
+            std::io::Write::write_all(&mut tmp, outcome.woven_text.as_bytes())?;
+            tmp.as_file().sync_all()?;
+            tmp.persist(&canonical_file).map_err(|e| e.error)?;
             files_modified += 1;
             total_replacements += outcome.replacements_count;
         }
@@ -169,6 +189,8 @@ fn is_skipped_extension(path: &Path) -> bool {
             | "sqlite3"
             | "wal"
             | "shm"
+            | "loom_tmp"
+            | "loom_atomic_tmp"
             | "exe"
             | "dll"
             | "so"

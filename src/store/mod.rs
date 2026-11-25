@@ -49,22 +49,20 @@ impl LoomStore {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create vault directory {}", parent.display())
             })?;
-            if !fast_kdf {
-                enforce_owner_only_acl(parent, true)?;
-            }
         }
 
         let conn = Connection::open(db_path)
             .with_context(|| format!("failed to open SQLite ledger at {}", db_path.display()))?;
-        if !fast_kdf {
-            enforce_owner_only_acl(db_path, false)?;
-        }
 
         conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
+
+        if !fast_kdf {
+            enforce_db_and_sidecar_acls(db_path)?;
+        }
 
         Self::init_schema(&conn)?;
 
@@ -346,7 +344,22 @@ pub fn default_ledger_path() -> PathBuf {
     base.join("loom").join("loom.db")
 }
 
-/// Enforce strict owner-only filesystem ACLs (`icacls /inheritance:r` on Windows, `0700`/`0600` on Unix).
+/// Enforce strict owner-only ACLs on the SQLite database file and any existing `-wal`/`-shm`
+/// sidecar files without mutating parent directory inheritance (`CLAVE-HORDE-02`).
+pub fn enforce_db_and_sidecar_acls(db_path: &Path) -> Result<()> {
+    enforce_owner_only_acl(db_path, false)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(suffix);
+        let sidecar = PathBuf::from(os);
+        if sidecar.exists() {
+            enforce_owner_only_acl(&sidecar, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Enforce fail-closed owner-only filesystem ACLs (`icacls /inheritance:r` on Windows, `0700`/`0600` on Unix).
 pub fn enforce_owner_only_acl(path: &Path, is_dir: bool) -> Result<()> {
     #[cfg(unix)]
     {
@@ -355,27 +368,65 @@ pub fn enforce_owner_only_acl(path: &Path, is_dir: bool) -> Result<()> {
         let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, perms)
             .with_context(|| format!("failed to set Unix mode {:o} on {}", mode, path.display()))?;
+        let applied = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if applied != mode {
+            return Err(anyhow!(
+                "effective Unix mode {:o} != {:o} on {}",
+                applied,
+                mode,
+                path.display()
+            ));
+        }
     }
 
     #[cfg(windows)]
     {
-        let _ = is_dir;
-        if let Ok(username) = std::env::var("USERNAME")
-            && !username.trim().is_empty()
-        {
-            let grant_spec = if is_dir {
-                format!("{username}:(OI)(CI)F")
-            } else {
-                format!("{username}:F")
-            };
-            let _ = std::process::Command::new("icacls")
-                .arg(path)
-                .arg("/inheritance:r")
-                .arg("/grant:r")
-                .arg(&grant_spec)
-                .output();
+        let principal = resolve_windows_owner_principal()?;
+        let grant_spec = if is_dir {
+            format!("{principal}:(OI)(CI)F")
+        } else {
+            format!("{principal}:F")
+        };
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(&grant_spec)
+            .output()
+            .with_context(|| format!("failed to execute icacls on {}", path.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(anyhow!(
+                "icacls failed on {} ({}): {} {}",
+                path.display(),
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            ));
         }
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_windows_owner_principal() -> Result<String> {
+    if let Ok(out) = std::process::Command::new("whoami").output()
+        && out.status.success()
+    {
+        let who = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !who.is_empty() {
+            return Ok(who);
+        }
+    }
+    if let Ok(username) = std::env::var("USERNAME") {
+        let trimmed = username.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err(anyhow!(
+        "unable to resolve Windows owner principal via whoami or USERNAME"
+    ))
 }

@@ -11,9 +11,7 @@ use uuid::Uuid;
 
 use crate::crypto::{
     deterministic_token_hex,
-    fpe::{
-        feistel16_encrypt, fpe_decrypt_ipv4_192_168, fpe_encrypt_ipv4_192_168, fpe_encrypt_uuid,
-    },
+    fpe::{fpe_decrypt_ipv4_192_168, fpe_encrypt_ipv4_192_168, fpe_encrypt_uuid},
 };
 use crate::detector::{
     DetectedSpan, LoomDetector,
@@ -104,9 +102,10 @@ impl<'a> LoomEngine<'a> {
         let mappings = self.store.list_all_mappings()?;
         let mut restored_count = 0usize;
 
-        // Stage 1: Aho-Corasick over ledger mappings (sorted longest synthetic token first)
+        // Stage 1: Aho-Corasick over reversible ledger mappings (excluding one-way INJ/UINVIS quarantines)
         let mut pairs: Vec<(String, String)> = mappings
             .into_iter()
+            .filter(|m| m.category != "INJ" && m.category != "UINVIS")
             .map(|m| (m.synthetic_value, m.real_value))
             .collect();
         pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -189,7 +188,7 @@ impl<'a> LoomEngine<'a> {
                     real.split_once('@').unwrap_or((real, "example.com"));
                 let user_tag = deterministic_token_hex(&subkeys.mac_key, "MAIL_USER", user_part, 8);
                 let syn_domain = if let Ok(ip) = Ipv4Addr::from_str(domain_part) {
-                    self.synthesize_ipv4(ip)
+                    self.synthesize_ipv4(ip)?
                 } else {
                     "example.com".to_string()
                 };
@@ -216,30 +215,69 @@ impl<'a> LoomEngine<'a> {
             }
             EntityCategory::Ipv4 => {
                 if let Ok(ip) = Ipv4Addr::from_str(real) {
-                    self.synthesize_ipv4(ip)
+                    self.synthesize_ipv4(ip)?
                 } else {
                     "198.51.100.250".to_string()
                 }
+            }
+            EntityCategory::Phone => {
+                let tag = deterministic_token_hex(&subkeys.mac_key, "PHONE", real, 8);
+                format!("+1555019{tag}")
+            }
+            EntityCategory::PrivateKeyPem => {
+                let tag = deterministic_token_hex(&subkeys.mac_key, "PEM", real, 16);
+                format!("-----BEGIN SYNTHETIC PRIVATE KEY BLOCK id_{tag}-----")
+            }
+            EntityCategory::PromptInjection => {
+                // One-way quarantine (`CLAVE-HORDE-03`): deterministic tag, never stored in reversible ledger.
+                let tag = deterministic_token_hex(&subkeys.mac_key, "INJ", real, 16);
+                return Ok(format!("[QUARANTINED_INJECTION_SPAN_{tag}]"));
+            }
+            EntityCategory::InvisibleUnicode => {
+                // One-way carrier strip (`CLAVE-HORDE-03`): 64-bit tag, never stored in reversible ledger.
+                let tag = deterministic_token_hex(&subkeys.mac_key, "UINVIS", real, 16);
+                return Ok(format!("[STRIPPED_CARRIER_{tag}]"));
             }
         };
 
         self.store.get_or_insert_mapping(cat_code, real, &candidate)
     }
 
-    fn synthesize_ipv4(&self, ip: Ipv4Addr) -> String {
+    fn synthesize_ipv4(&self, ip: Ipv4Addr) -> Result<String> {
         let subkeys = self.store.subkeys();
         if let Some(fpe_ip) = fpe_encrypt_ipv4_192_168(&subkeys.fpe_key, ip) {
-            return fpe_ip.to_string();
+            return Ok(fpe_ip.to_string());
         }
-        let o = ip.octets();
-        let host16 = ((o[2] as u16) << 8) ^ (o[3] as u16) ^ ((o[0] as u16) << 4) ^ (o[1] as u16);
-        let perm = feistel16_encrypt(&subkeys.fpe_key, b"loom-ipv4-other", host16);
-        // Map into RFC 5737 TEST-NET-2 (198.51.100.1..254) or TEST-NET-3 (203.0.113.1..254)
-        let last_octet = ((perm & 0xFF) as u8).clamp(1, 254);
-        if (perm >> 8) & 1 == 0 {
-            format!("198.51.100.{last_octet}")
-        } else {
-            format!("203.0.113.{last_octet}")
+        let ip_str = ip.to_string();
+        if let Some(existing) = self.store.lookup_synthetic_by_real("IPV4", &ip_str)? {
+            return Ok(existing);
         }
+
+        // Map non-192.168 IPv4s into RFC 2544 benchmark pool 198.18.0.0/15 (130,048 usable host slots:
+        // 198.{18..=19}.{0..=255}.{1..=254}) with deterministic collision probing (`CLAVE-HORDE-03`).
+        for probe in 0u32..4096 {
+            let mut hasher = blake3::Hasher::new_keyed(&subkeys.fpe_key);
+            hasher.update(b"loom-ipv4-rfc2544-v2:");
+            hasher.update(&ip.octets());
+            hasher.update(&probe.to_le_bytes());
+            let digest = hasher.finalize();
+            let raw = u32::from_le_bytes([
+                digest.as_bytes()[0],
+                digest.as_bytes()[1],
+                digest.as_bytes()[2],
+                digest.as_bytes()[3],
+            ]);
+            let second_octet = 18u8 + ((raw & 1) as u8);
+            let third_octet = ((raw >> 1) & 0xFF) as u8;
+            let fourth_octet = 1u8 + (((raw >> 9) % 254) as u8);
+            let candidate = format!("198.{second_octet}.{third_octet}.{fourth_octet}");
+
+            match self.store.lookup_real_by_synthetic(&candidate)? {
+                None => return Ok(candidate),
+                Some(owner) if owner == ip_str => return Ok(candidate),
+                Some(_) => continue,
+            }
+        }
+        anyhow::bail!("exhausted synthetic RFC 2544 IPv4 collision probes")
     }
 }

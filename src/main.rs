@@ -15,8 +15,9 @@ use loom_scrubber::{
         repo::{audit_directory, weave_directory_in_place},
     },
     store::{LoomStore, default_ledger_path},
-    tui::{LoomTuiApp, run_interactive_tui},
+    tui::{LoomTuiApp, run_interactive_tui, ui::sanitize_terminal_str},
 };
+use zeroize::Zeroizing;
 
 const KEYRING_SERVICE: &str = "clave-crypto-scrubber";
 const KEYRING_USER: &str = "default-ledger";
@@ -24,10 +25,10 @@ const KEYRING_USER: &str = "default-ledger";
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db.clone().unwrap_or_else(default_ledger_path);
-    let mut passphrase = resolve_passphrase(&cli)?;
+    let passphrase = resolve_passphrase(&cli)?;
 
     let store = LoomStore::open_with_passphrase(&db_path, passphrase.as_bytes(), false)?;
-    zeroize::Zeroize::zeroize(&mut passphrase);
+    drop(passphrase);
     let engine = LoomEngine::new(&store);
 
     match cli.command {
@@ -74,10 +75,30 @@ fn main() -> Result<()> {
                 .context("failed to read UTF-8 text from system clipboard")?;
             if restore {
                 let outcome = engine.unweave_text(&current)?;
-                cb.set_text(outcome.restored_text)
-                    .context("failed to write restored text to clipboard")?;
+                let restored = Zeroizing::new(outcome.restored_text);
+                #[cfg(windows)]
+                {
+                    use arboard::SetExtWindows;
+                    cb.set()
+                        .exclude_from_monitoring()
+                        .text(restored.as_str())
+                        .context("failed to write restored text to clipboard")?;
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    use arboard::SetExtApple;
+                    cb.set()
+                        .exclude_from_history()
+                        .text(restored.as_str())
+                        .context("failed to write restored text to clipboard")?;
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
+                {
+                    cb.set_text(restored.as_str())
+                        .context("failed to write restored text to clipboard")?;
+                }
                 eprintln!(
-                    "[clave] Restored {} synthetic tokens in system clipboard.",
+                    "[clave] Restored {} synthetic tokens in system clipboard (private mode).",
                     outcome.restored_count
                 );
             } else {
@@ -115,7 +136,10 @@ fn main() -> Result<()> {
                     for f in &report.findings {
                         println!(
                             "  [{:<4}] {}:{} -> {}",
-                            f.category, f.file_path, f.line_number, f.snippet
+                            sanitize_terminal_str(&f.category),
+                            sanitize_terminal_str(&f.file_path),
+                            f.line_number,
+                            sanitize_terminal_str(&f.snippet)
                         );
                     }
                 }
@@ -138,8 +162,14 @@ fn main() -> Result<()> {
                 let saved = store.upsert_custom_term(&term, &syn)?;
                 println!("[clave] Registered custom dictionary rule: [REDACTED] <-> {saved}");
             }
-            DictAction::List { json } => {
-                let mappings = store.list_all_mappings()?;
+            DictAction::List { json, reveal } => {
+                let mut mappings = store.list_all_mappings()?;
+                if !reveal {
+                    for m in &mut mappings {
+                        zeroize::Zeroize::zeroize(&mut m.real_value);
+                        m.real_value = "[REDACTED — pass --reveal]".to_string();
+                    }
+                }
                 if json {
                     println!("{}", serde_json::to_string_pretty(&mappings)?);
                 } else {
@@ -147,7 +177,9 @@ fn main() -> Result<()> {
                     for m in mappings {
                         println!(
                             "  [{:<4}] {:<32} <= [AEAD: {}]",
-                            m.category, m.synthetic_value, m.real_value
+                            sanitize_terminal_str(&m.category),
+                            sanitize_terminal_str(&m.synthetic_value),
+                            sanitize_terminal_str(&m.real_value)
                         );
                     }
                 }
@@ -173,28 +205,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_passphrase(cli: &Cli) -> Result<String> {
-    if let Some(p) = &cli.passphrase
-        && !p.is_empty()
-    {
+fn resolve_passphrase(cli: &Cli) -> Result<Zeroizing<String>> {
+    if let Some(ref key_file) = cli.passphrase_file {
+        let raw = Zeroizing::new(
+            std::fs::read_to_string(key_file)
+                .with_context(|| format!("failed to read passphrase file {}", key_file.display()))?,
+        );
+        let trimmed = Zeroizing::new(raw.trim().to_string());
+        if trimmed.is_empty() {
+            return Err(anyhow!(
+                "Passphrase file {} cannot be empty",
+                key_file.display()
+            ));
+        }
         if cli.keyring
             && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
         {
-            let _ = entry.set_password(p);
+            let _ = entry.set_password(trimmed.as_str());
         }
-        return Ok(p.clone());
+        return Ok(trimmed);
+    }
+
+    if let Ok(env_pass) = std::env::var("CLAVE_PASSPHRASE") {
+        let wrapped = Zeroizing::new(env_pass);
+        if !wrapped.is_empty() {
+            if cli.keyring
+                && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            {
+                let _ = entry.set_password(wrapped.as_str());
+            }
+            return Ok(wrapped);
+        }
     }
 
     if cli.keyring
         && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
         && let Ok(saved) = entry.get_password()
-        && !saved.is_empty()
     {
-        return Ok(saved);
+        let wrapped = Zeroizing::new(saved);
+        if !wrapped.is_empty() {
+            return Ok(wrapped);
+        }
     }
 
-    let prompt_pass = rpassword::prompt_password("Clave Master Passphrase: ")
-        .context("failed to read passphrase from terminal")?;
+    let prompt_pass = Zeroizing::new(
+        rpassword::prompt_password("Clave Master Passphrase: ")
+            .context("failed to read passphrase from terminal")?,
+    );
     if prompt_pass.is_empty() {
         return Err(anyhow!("Passphrase cannot be empty"));
     }
@@ -202,7 +259,7 @@ fn resolve_passphrase(cli: &Cli) -> Result<String> {
     if cli.keyring
         && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
     {
-        let _ = entry.set_password(&prompt_pass);
+        let _ = entry.set_password(prompt_pass.as_str());
     }
 
     Ok(prompt_pass)

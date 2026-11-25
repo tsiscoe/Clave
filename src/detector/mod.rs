@@ -6,7 +6,7 @@ pub mod patterns;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use patterns::{
     EntityCategory, compiled_patterns, should_scrub_email, should_scrub_ipv4,
-    should_scrub_user_path, should_scrub_uuid,
+    should_scrub_phone, should_scrub_user_path, should_scrub_uuid,
 };
 
 /// A non-overlapping sensitive span detected in an input text buffer.
@@ -130,6 +130,50 @@ impl LoomDetector {
                     matched_text: m.as_str().to_string(),
                 });
             }
+        }
+
+        // 8. International Phone Numbers (Colmena Hygiene)
+        for m in pat.phone.find_iter(text) {
+            if should_scrub_phone(m.as_str()) {
+                candidates.push(DetectedSpan {
+                    start: m.start(),
+                    end: m.end(),
+                    category: EntityCategory::Phone,
+                    matched_text: m.as_str().to_string(),
+                });
+            }
+        }
+
+        // 9. PEM Private Key Blocks (Colmena Hygiene)
+        for m in pat.private_key_pem.find_iter(text) {
+            if !m.as_str().contains("SYNTHETIC PRIVATE KEY") {
+                candidates.push(DetectedSpan {
+                    start: m.start(),
+                    end: m.end(),
+                    category: EntityCategory::PrivateKeyPem,
+                    matched_text: m.as_str().to_string(),
+                });
+            }
+        }
+
+        // 10. Prompt Injection & Turn Boundaries (Colmena Reader-Safety)
+        for m in pat.prompt_injection.find_iter(text) {
+            candidates.push(DetectedSpan {
+                start: m.start(),
+                end: m.end(),
+                category: EntityCategory::PromptInjection,
+                matched_text: m.as_str().to_string(),
+            });
+        }
+
+        // 11. Invisible Unicode Smuggling (Colmena Reader-Safety)
+        for m in pat.invisible_unicode.find_iter(text) {
+            candidates.push(DetectedSpan {
+                start: m.start(),
+                end: m.end(),
+                category: EntityCategory::InvisibleUnicode,
+                matched_text: m.as_str().to_string(),
+            });
         }
 
         resolve_non_overlapping(candidates)

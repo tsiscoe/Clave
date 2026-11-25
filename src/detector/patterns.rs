@@ -23,6 +23,14 @@ pub enum EntityCategory {
     Uuid,
     /// IPv4 address (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`, or public routable IPv4).
     Ipv4,
+    /// International telephone number (Colmena hygiene book).
+    Phone,
+    /// Raw unencrypted PEM private key block (Colmena hygiene book).
+    PrivateKeyPem,
+    /// Prompt injection or LLM turn-boundary scaffolding (Colmena reader-safety book).
+    PromptInjection,
+    /// Invisible Unicode carrier characters used for prompt smuggling (Colmena reader-safety book).
+    InvisibleUnicode,
 }
 
 impl EntityCategory {
@@ -36,6 +44,10 @@ impl EntityCategory {
             Self::UserPath => "PATH",
             Self::Uuid => "UUID",
             Self::Ipv4 => "IPV4",
+            Self::Phone => "PHONE",
+            Self::PrivateKeyPem => "PEM",
+            Self::PromptInjection => "INJ",
+            Self::InvisibleUnicode => "UINVIS",
         }
     }
 
@@ -43,12 +55,16 @@ impl EntityCategory {
     pub fn priority(&self) -> u8 {
         match self {
             Self::CustomDict => 1,
-            Self::ApiKey => 2,
-            Self::Jwt => 3,
-            Self::Email => 4,
-            Self::UserPath => 5,
-            Self::Uuid => 6,
-            Self::Ipv4 => 7,
+            Self::PromptInjection => 2,
+            Self::InvisibleUnicode => 3,
+            Self::PrivateKeyPem => 4,
+            Self::ApiKey => 5,
+            Self::Jwt => 6,
+            Self::Email => 7,
+            Self::Phone => 8,
+            Self::UserPath => 9,
+            Self::Uuid => 10,
+            Self::Ipv4 => 11,
         }
     }
 }
@@ -60,13 +76,17 @@ pub struct CompiledPatterns {
     pub user_path: Regex,
     pub uuid: Regex,
     pub ipv4: Regex,
+    pub phone: Regex,
+    pub private_key_pem: Regex,
+    pub prompt_injection: Regex,
+    pub invisible_unicode: Regex,
 }
 
 pub fn compiled_patterns() -> &'static CompiledPatterns {
     static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| CompiledPatterns {
         api_key: Regex::new(
-            r"(?:sk-ant-api03-[A-Za-z0-9_\-]{10,}|sk-(?:proj-|live-|test-)?[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9\-]{12,}|AIza[0-9A-Za-z_\-]{35})",
+            r"(?:sk-ant-api03-[A-Za-z0-9_\-]{10,}|sk-(?:proj-|live-|test-)?[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9\-]{12,}|AIza[0-9A-Za-z_\-]{35}|1f916_sk_[A-Za-z0-9]+)",
         )
         .expect("valid api_key regex"),
         jwt: Regex::new(
@@ -86,6 +106,20 @@ pub fn compiled_patterns() -> &'static CompiledPatterns {
         )
         .expect("valid uuid regex"),
         ipv4: Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("valid ipv4 regex"),
+        phone: Regex::new(r"\+\d{1,3}[\s().\-]{0,3}\d(?:[\s().\-]{0,2}\d){7,12}\b")
+            .expect("valid phone regex"),
+        private_key_pem: Regex::new(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----)?",
+        )
+        .expect("valid private_key_pem regex"),
+        prompt_injection: Regex::new(
+            r"(?i)<\|(?:im_start|im_end|system|endoftext)\|>|\[/?(?:INST|SYS)\]|<<SYS>>|\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|prompts?|rules?|context)\b",
+        )
+        .expect("valid prompt_injection regex"),
+        invisible_unicode: Regex::new(
+            r"[\u{00AD}\u{200B}-\u{200F}\u{202A}-\u{202E}\u{2060}-\u{2064}\u{2066}-\u{2069}\u{FEFF}\u{E0000}-\u{E007F}]",
+        )
+        .expect("valid invisible_unicode regex"),
     })
 }
 
@@ -106,8 +140,8 @@ pub fn should_scrub_ipv4(ip_str: &str) -> Option<Ipv4Addr> {
     {
         return None;
     }
-    // Skip Loom's own synthetic FPE output block (10.244.0.0/16) so re-weaving is idempotent
-    if o[0] == 10 && o[1] == 244 {
+    // Skip Loom's own synthetic output blocks: 10.244.0.0/16 (LAN FPE) and 198.18.0.0/15 (RFC 2544 non-LAN pool)
+    if (o[0] == 10 && o[1] == 244) || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) {
         return None;
     }
     Some(ip)
@@ -148,4 +182,17 @@ pub fn should_scrub_user_path(path_match: &str) -> bool {
         || lower.contains("/user_")
         || lower.ends_with("\\public")
         || lower.ends_with("\\default"))
+}
+
+/// Returns `true` if `phone_match` is a real phone number rather than an RFC example or placeholder.
+pub fn should_scrub_phone(phone_match: &str) -> bool {
+    let s = phone_match.trim();
+    // Exclude +1-555 placeholder numbers or repetitive digits (Colmena hygiene allow rule)
+    if s.starts_with("+1555") || s.starts_with("+1-555") || s.starts_with("+1 555") || s.starts_with("+1.555") {
+        return false;
+    }
+    if s.starts_with("+0") || s.contains("0000000") || s.contains("1234567") {
+        return false;
+    }
+    true
 }
